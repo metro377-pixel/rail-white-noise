@@ -5,32 +5,27 @@ from scipy.signal import butter, lfilter
 import io
 import time
 
-# 페이지 기본 설정
 st.set_page_config(
     page_title="철도 백색소음 & 집중 타이머",
     page_icon="🚆",
     layout="centered"
 )
 
-# 저역 통과 필터 (날카로운 고음을 깎아 묵직한 저음 생성)
 def lowpass_filter(data, cutoff, fs, order=4):
     nyq = 0.5 * fs
     normal_cutoff = cutoff / nyq
     b, a = butter(order, normal_cutoff, btype='low', analog=False)
     return lfilter(b, a, data)
 
-# 철제 기차 사운드 합성 함수
 def generate_train_sound(duration=15, speed_kmh=100, rain_vol=0.2, rail_vol=0.8):
     sample_rate = 22050
     t = np.linspace(0, duration, int(sample_rate * duration), endpoint=False)
     
-    # 1. 차체 하부 및 선로 공명 저음
     white_noise = np.random.normal(0, 1, len(t))
     rumble = lowpass_filter(white_noise, cutoff=140, fs=sample_rate, order=3)
     lfo = 1.0 + 0.25 * np.sin(2 * np.pi * (speed_kmh / 60.0) * t)
     rumble = (rumble / (np.max(np.abs(rumble)) + 1e-6)) * 0.45 * lfo
 
-    # 2. 레일 이음매 충격음 (4축 대차 리듬)
     rail_clicks = np.zeros_like(t)
     interval = 25.0 / (speed_kmh / 3.6)
     
@@ -61,13 +56,10 @@ def generate_train_sound(duration=15, speed_kmh=100, rain_vol=0.2, rail_vol=0.8)
                 rail_clicks[idx:idx+click_len] += combined_hit
                 
         current_time += interval
-
-    # 3. 창밖 빗소리
-    rain_raw = np.random.normal(0, 1, len(t))
+        rain_raw = np.random.normal(0, 1, len(t))
     rain = lowpass_filter(rain_raw, cutoff=1800, fs=sample_rate, order=2)
     rain = (rain / (np.max(np.abs(rain)) + 1e-6)) * 0.25
 
-    # 사운드 믹싱
     mixed = (rumble * rail_vol) + (rail_clicks * rail_vol * 1.3) + (rain * rain_vol)
     mixed = np.tanh(mixed * 1.2)
     mixed = mixed / (np.max(np.abs(mixed)) + 1e-6)
@@ -78,7 +70,6 @@ def generate_train_sound(duration=15, speed_kmh=100, rain_vol=0.2, rail_vol=0.8)
     wavfile.write(buf, sample_rate, audio_int16)
     return buf.getvalue()
 
-# 노선 데이터
 ROUTES = {
     "🚂 무궁화호 중앙선 (청량리 ➔ 안동)": {
         "minutes": 180,
@@ -107,10 +98,8 @@ ROUTES = {
     }
 }
 
-# UI 구성
 st.title("🚆 철도 백색소음 & 집중 타이머")
 st.markdown("창밖 풍경을 떠올리며 목적지까지 열차와 함께 집중해 보세요.")
-
 st.divider()
 
 selected_route = st.selectbox("탑승할 열차와 노선을 선택하세요:", list(ROUTES.keys()))
@@ -139,9 +128,29 @@ audio_bytes = generate_train_sound(
 )
 st.audio(audio_bytes, format="audio/wav", loop=True)
 st.caption("💡 이어폰이나 스피커로 들으면 저음의 '쿵-덕' 울림이 훨씬 생생하게 들립니다.")
-
 st.divider()
 
 st.subheader("⏱️ 열차 운행(집중) 타이머")
 
-if st.button("🔔 출발 신호 울
+if st.button("🔔 출발 신호 울리기 (타이머 시작)", type="primary", use_container_width=True):
+    total_seconds = route_info["minutes"] * 60
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    st.toast("삐-! 열차가 출발합니다. 집중을 시작하세요!")
+    
+    for elapsed in range(total_seconds + 1):
+        remaining = total_seconds - elapsed
+        mins, secs = divmod(remaining, 60)
+        hours, mins = divmod(mins, 60)
+        
+        progress = elapsed / total_seconds
+        progress_bar.progress(progress)
+        
+        status_text.markdown(
+            f"### 🚉 목적지 도착까지 남은 시간: `{hours:02d}:{mins:02d}:{secs:02d}` ({int(progress*100)}% 운행 중)"
+        )
+        time.sleep(1)
+        
+    st.balloons()
+    st.success("🎉 안내 말씀드립니다. 우리 열차는 잠시 후 최종 목적지에 도착합니다. 고생하셨습니다!")
