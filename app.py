@@ -1,8 +1,9 @@
 import streamlit as st
 import numpy as np
-from scipy.io import wavfile
+from pydub import AudioSegment
 from scipy.signal import butter, lfilter
 import io
+import os
 import time
 
 st.set_page_config(
@@ -11,116 +12,89 @@ st.set_page_config(
     layout="centered"
 )
 
-def bandpass_filter(data, lowcut, highcut, fs, order=3):
+def bandpass_filter(data, lowcut, highcut, fs, order=2):
     nyq = 0.5 * fs
     low = lowcut / nyq
     high = highcut / nyq
     b, a = butter(order, [low, high], btype='band')
     return lfilter(b, a, data)
 
-def lowpass_filter(data, cutoff, fs, order=3):
-    nyq = 0.5 * fs
-    normal_cutoff = cutoff / nyq
-    b, a = butter(order, normal_cutoff, btype='low')
-    return lfilter(b, a, data)
+# 실제 MP3 파일을 불러와 속도 조절 및 빗소리를 믹싱하는 함수 (캐싱으로 빠른 로딩)
+@st.cache_data(show_spinner="열차 주행음을 준비하고 있습니다...")
+def load_and_mix_train_audio(mp3_path, speed_ratio=1.0, train_vol=0.9, rain_vol=0.15):
+    # 1. 실제 기차 MP3 불러오기
+    sound = AudioSegment.from_mp3(mp3_path)
+    
+    # 열차 노선(KTX, 무궁화 등)에 맞춰 재생 속도 자연스럽게 조절
+    if speed_ratio != 1.0:
+        new_frame_rate = int(sound.frame_rate * speed_ratio)
+        sound = sound._spawn(sound.raw_data, overrides={"frame_rate": new_frame_rate})
+        sound = sound.set_frame_rate(44100)
 
-def generate_metallic_train_sound(duration=15, speed_kmh=90, rain_vol=0.1, rail_vol=0.9):
-    sample_rate = 22050
-    t = np.linspace(0, duration, int(sample_rate * duration), endpoint=False)
-    white = np.random.normal(0, 1, len(t))
+    # 모노/스테레오 통일 및 numpy 배열 변환
+    sound = sound.set_channels(1)
+    sample_rate = sound.frame_rate
+    samples = np.array(sound.get_array_of_samples(), dtype=np.float32)
+    samples = samples / (np.max(np.abs(samples)) + 1e-6)
 
-    # 1. 차체 하부 베이스 진동 (쇳소리를 가리지 않도록 절제된 저음)
-    rumble = lowpass_filter(white, cutoff=110, fs=sample_rate, order=3)
-    rumble = (rumble / (np.max(np.abs(rumble)) + 1e-6)) * 0.22
+    # 루프 재생 시 앞뒤가 부드럽게 이어지도록 0.5초 크로스페이드 처리
+    fade_len = int(0.5 * sample_rate)
+    if len(samples) > fade_len * 2:
+        fade_in = np.linspace(0, 1, fade_len)
+        fade_out = np.linspace(1, 0, fade_len)
+        samples[:fade_len] *= fade_in
+        samples[-fade_len:] *= fade_out
 
-    # 2. 강철 레일-차륜 연속 금속 마찰음 (쇠가 긁히는 "쉬이이-챠르르" 소리)
-    steel_grind = bandpass_filter(white, lowcut=1800, highcut=4800, fs=sample_rate, order=3)
-    # 레일 굴곡에 따라 쇠 긁히는 소리가 주기적으로 강해지는 변조
-    grind_mod = 1.0 + 0.55 * np.sin(2 * np.pi * (speed_kmh / 28.0) * t)
-    steel_grind = (steel_grind / (np.max(np.abs(steel_grind)) + 1e-6)) * 0.35 * grind_mod
+    # 2. 창밖 빗소리 생성 (실제 기차 소리와 어우러지는 부드러운 빗소리)
+    rain_raw = np.random.normal(0, 1, len(samples))
+    rain = bandpass_filter(rain_raw, lowcut=700, highcut=4200, fs=sample_rate, order=2)
+    rain = (rain / (np.max(np.abs(rain)) + 1e-6)) * 0.25
 
-    # 3. 강철 레일 이음매 타격음 ("깡-덕! ... 깡-덕!" 금속 공명음)
-    rail_clicks = np.zeros_like(t)
-    speed_ms = speed_kmh / 3.6
-    interval = 25.0 / speed_ms
-    axle_gap = 2.1 / speed_ms
-    bogie_gap = 13.5 / speed_ms
-
-    current_time = 0.2
-    while current_time < duration - 1.0:
-        hit_offsets = [0.0, axle_gap, bogie_gap, bogie_gap + axle_gap]
-        for i, offset in enumerate(hit_offsets):
-            idx = int((current_time + offset) * sample_rate)
-            click_len = int(0.09 * sample_rate)
-            if idx + click_len < len(t):
-                ct = np.linspace(0, 0.09, click_len)
-                # 앞바퀴("깡-")와 뒷바퀴("-덕")의 미세한 음정 차이
-                pitch_shift = 1.08 if i % 2 == 0 else 0.94
-
-                # 강철 레일이 울리는 비정수배 금속 배음 (쇠 종/레일 타격 공명)
-                metal_ring = (
-                    0.8 * np.sin(2 * np.pi * (155 * pitch_shift) * ct) * np.exp(-ct * 42) +
-                    1.0 * np.sin(2 * np.pi * (435 * pitch_shift) * ct) * np.exp(-ct * 58) +
-                    0.9 * np.sin(2 * np.pi * (975 * pitch_shift) * ct) * np.exp(-ct * 75) +
-                    0.7 * np.sin(2 * np.pi * (1840 * pitch_shift) * ct) * np.exp(-ct * 95) +
-                    0.5 * np.sin(2 * np.pi * (2890 * pitch_shift) * ct) * np.exp(-ct * 120)
-                )
-
-                # 이음매 틈새를 때리는 날카로운 고주파 쇠 파열음
-                steel_snap = np.random.normal(0, 1, click_len) * np.exp(-ct * 90)
-                steel_snap = bandpass_filter(steel_snap, lowcut=1200, highcut=5200, fs=sample_rate, order=2)
-
-                accent = 1.0 if i % 2 == 0 else 0.85
-                hit = (metal_ring * 1.15 + steel_snap * 1.4) * accent
-                rail_clicks[idx:idx+click_len] += hit
-
-        current_time += interval
-        # 4. 창밖 빗소리
-    rain_raw = np.random.normal(0, 1, len(t))
-    rain = bandpass_filter(rain_raw, lowcut=800, highcut=4500, fs=sample_rate, order=2)
-    rain = (rain / (np.max(np.abs(rain)) + 1e-6)) * 0.18
-
-    # 전체 사운드 믹싱 (쇳소리 비율 극대화)
-    train_total = rumble + steel_grind + (rail_clicks * 1.65)
-    mixed = (train_total * rail_vol) + (rain * rain_vol)
-    mixed = np.tanh(mixed * 1.2)
+    # 3. 실제 기차 소리 + 빗소리 믹싱
+    mixed = (samples * train_vol) + (rain * rain_vol)
     mixed = mixed / (np.max(np.abs(mixed)) + 1e-6)
 
+    # WAV 메모리 버퍼로 변환
     audio_int16 = np.int16(mixed * 32767)
+    out_seg = AudioSegment(
+        audio_int16.tobytes(),
+        frame_rate=sample_rate,
+        sample_width=2,
+        channels=1
+    )
     buf = io.BytesIO()
-    wavfile.write(buf, sample_rate, audio_int16)
+    out_seg.export(buf, format="wav")
     return buf.getvalue()
-
-ROUTES = {
+    ROUTES = {
     "🚂 무궁화호 중앙선 (청량리 ➔ 안동)": {
         "minutes": 180,
-        "speed": 90,
-        "desc": "차가운 강철 레일 이음매 타격음('깡-덕')과 금속 마찰음이 선명한 노선"
+        "speed_ratio": 1.0,
+        "desc": "원본 녹음 그대로의 리얼한 레일 이음매 타격음과 쇠바퀴 소리를 들을 수 있는 노선"
     },
     "🚃 영동선 눈꽃열차 (강릉 ➔ 동해)": {
         "minutes": 45,
-        "speed": 70,
-        "desc": "느릿하게 선로를 긁으며 달리는 45분 집중 코스"
+        "speed_ratio": 0.88,
+        "desc": "조금 더 느긋하고 묵직한 리듬으로 45분간 집중하기 좋은 코스"
     },
     "🚆 ITX-새마을 경부선 (서울 ➔ 대전)": {
         "minutes": 115,
-        "speed": 130,
-        "desc": "경쾌한 속도감과 일정한 4박자 쇳소리가 돋보이는 노선"
+        "speed_ratio": 1.15,
+        "desc": "경쾌하게 속도를 높여 달리는 115분 집중 노선"
     },
     "🚄 KTX 경부선 (서울 ➔ 부산)": {
         "minutes": 165,
-        "speed": 250,
-        "desc": "빠르게 연속되는 레일 마찰음과 고속 주행음"
+        "speed_ratio": 1.32,
+        "desc": "빠른 템포의 레일 주행음과 함께하는 장거리 집중 코스"
     },
     "⏱️ 테스트용 미니 노선 (1분 시운전)": {
         "minutes": 1,
-        "speed": 90,
+        "speed_ratio": 1.0,
         "desc": "타이머 작동 확인을 위한 짧은 시운전 코스"
     }
 }
 
-st.title("🚆 철도 백색소음 & 집중 타이머")
-st.markdown("강철 레일 위를 달리는 쇠바퀴 소리를 들으며 목적지까지 집중해 보세요.")
+st.title("🚆 리얼 철도 백색소음 & 집중 타이머")
+st.markdown("실제 열차 연결부(베스티ビュ)에서 녹음된 생생한 레일 소리와 함께 목적지까지 집중해 보세요.")
 st.divider()
 
 selected_route = st.selectbox("탑승할 열차와 노선을 선택하세요:", list(ROUTES.keys()))
@@ -130,25 +104,31 @@ col1, col2 = st.columns(2)
 with col1:
     st.metric(label="예상 소요 시간 (집중 목표)", value=f"{route_info['minutes']}분")
 with col2:
-    st.metric(label="평균 운행 속도", value=f"{route_info['speed']} km/h")
+    st.metric(label="주행 템포 배속", value=f"{route_info['speed_ratio']}x")
 
 st.info(f"📢 **승무원 안내:** {route_info['desc']}")
 
 st.subheader("🎛️ 열차 사운드 믹서")
 c1, c2 = st.columns(2)
 with c1:
-    rail_vol = st.slider("강철 레일 & 쇠바퀴 소리 크기", 0.0, 1.0, 0.95)
+    train_vol = st.slider("실제 열차 & 레일 소리 크기", 0.0, 1.0, 0.95)
 with c2:
-    rain_vol = st.slider("창밖 빗소리 크기", 0.0, 1.0, 0.1)
+    rain_vol = st.slider("창밖 빗소리 크기", 0.0, 1.0, 0.15)
 
-audio_bytes = generate_metallic_train_sound(
-    duration=15,
-    speed_kmh=route_info["speed"],
-    rain_vol=rain_vol,
-    rail_vol=rail_vol
-)
-st.audio(audio_bytes, format="audio/wav", loop=True)
-st.caption("💡 빗소리를 0.0으로 내리면 쇠바퀴와 강철 레일이 부딪히는 소리만 순수하게 들립니다.")
+MP3_FILE = "train.mp3"
+
+if os.path.exists(MP3_FILE):
+    audio_bytes = load_and_mix_train_audio(
+        mp3_path=MP3_FILE,
+        speed_ratio=route_info["speed_ratio"],
+        train_vol=train_vol,
+        rain_vol=rain_vol
+    )
+    st.audio(audio_bytes, format="audio/wav", loop=True)
+    st.caption("💡 빗소리를 0.0으로 설정하면 순수 원본 기차 녹음만 들을 수 있습니다.")
+else:
+    st.error("⚠️ `train.mp3` 파일을 찾을 수 없습니다! GitHub 저장소의 `app.py`와 같은 폴더에 `train.mp3` 파일을 업로드해 주세요.")
+
 st.divider()
 
 st.subheader("⏱️ 열차 운행(집중) 타이머")
